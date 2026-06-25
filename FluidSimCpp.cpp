@@ -15,7 +15,7 @@
 struct Vec2 { float x; float y; };
 
 namespace cfg {
-    constexpr int MaxParticles = 10000;
+    constexpr int MaxParticles = 100000;
     constexpr int InitialCount = 1500;
     constexpr float MouseForce = -2500.0f;
     constexpr float MouseRadius = 100.0f;
