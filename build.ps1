@@ -8,8 +8,9 @@
 
     MSVC has no /O3 switch. The closest equivalent to gcc/clang -O3 is:
         /O2 /Ob3 /Oi /Ot /GL /Gy /Gw /fp:fast  + /LTCG /OPT:REF /OPT:ICF
-    -Native additionally enables /arch:AVX2 and /GS- (faster, but the binary
-    then requires an AVX2 capable CPU and drops buffer security checks).
+    /arch:AVX2 is always on - the optimized force kernel is written in AVX2/FMA
+    intrinsics. The binary checks CPUID at startup and refuses to run without it.
+    -Native additionally drops buffer security checks (/GS-).
 
 .EXAMPLE
     .\build.ps1                 # optimized x64 build
@@ -94,8 +95,9 @@ function Invoke-Build {
         '/Gy', '/Gw'                 # function/data level linking -> dead code stripping
         '/GF'                        # pool identical string literals
         '/fp:fast'                   # relaxed float math - fine for a particle sim
+        '/arch:AVX2'                 # required - the force kernel uses AVX2/FMA intrinsics
     )
-    if ($Native) { $compilerArgs += @('/arch:AVX2', '/GS-') }
+    if ($Native) { $compilerArgs += @('/GS-') }
 
     $compilerArgs += @("/Fo$ObjDir\", "/Fe$ExePath", $SourceFile)
 
@@ -110,7 +112,9 @@ function Invoke-Build {
 
     Write-Step "Compiling $Arch$(if ($Native) { ' (AVX2)' })"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    & cl.exe @compilerArgs @linkerArgs
+    # Out-Host keeps compiler diagnostics on the console; without it they would
+    # be swallowed into this function's return value.
+    & cl.exe @compilerArgs @linkerArgs | Out-Host
     $exitCode = $LASTEXITCODE
     $sw.Stop()
 
