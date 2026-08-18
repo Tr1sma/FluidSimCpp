@@ -88,7 +88,10 @@ static float physicsRateFor(int particleCount, int width, int height) {
     return rate > cfg::MaxPhysicsHz ? cfg::MaxPhysicsHz : rate;
 }
 
-// Rate needed to keep the fastest particle under MaxTravelPerStep.
+// Rate needed to keep the fastest approach between two interacting particles
+// under MaxTravelPerStep. Relative motion is the quantity that matters:
+// particles falling together as a block never tunnel, however fast they drop,
+// and a particle with no neighbour in range contributes nothing at all.
 static float cflRateFor(float maxSpeed) {
     if (maxSpeed <= 0.0f) return 0.0f;
     const float maxTravel = cfg::MaxTravelPerStep * cfg::CollisionRadius;
@@ -315,7 +318,8 @@ public:
     virtual int count() const = 0;
     virtual void seedUniform(int n, uint32_t seed) = 0;
     virtual void collectPositions(std::vector<float>& out) const = 0;
-    // Fastest particle of the last step. Drives the CFL step-size limit.
+    // Largest relative speed between any two interacting particles in the
+    // last step. Drives the CFL step-size limit.
     virtual float lastMaxSpeed() const = 0;
 };
 
@@ -441,6 +445,7 @@ private:
 
     void computeForces() {
         const float collisionRadiusSqr = cfg::CollisionRadius * cfg::CollisionRadius;
+        float maxRelSqr = 0.0f;
         for (int i = 0; i < particleCount; ++i) {
             float forceX = 0.0f;
             float forceY = 0.0f;
@@ -487,6 +492,9 @@ private:
                                 float relVelY = vel[neighborIdx].y - myVY;
                                 forceX += relVelX * cfg::DampingFactor;
                                 forceY += relVelY * cfg::DampingFactor;
+
+                                const float relSqr = relVelX * relVelX + relVelY * relVelY;
+                                if (relSqr > maxRelSqr) maxRelSqr = relSqr;
                             }
                         }
                         neighborIdx = nextParticle[neighborIdx];
@@ -511,12 +519,12 @@ private:
 
             acc[i] = Vec2{ accX, accY };
         }
+        maxSpeed = std::sqrt(maxRelSqr);
     }
 
     void integrate(float dt) {
         const float boundaryFriction = 0.5f;
         const float bounce = -0.2f;
-        float maxSpeedSqr = 0.0f;
         for (int i = 0; i < particleCount; ++i) {
             Vec2 v = vel[i];
             Vec2 a = acc[i];
@@ -532,13 +540,9 @@ private:
             if (p.x > (float)screenWidth) { p.x = (float)screenWidth; v.x *= bounce; }
             if (p.y > (float)screenHeight) { p.y = (float)screenHeight; v.y *= bounce; v.x *= boundaryFriction; }
 
-            const float speedSqr = v.x * v.x + v.y * v.y;
-            if (speedSqr > maxSpeedSqr) maxSpeedSqr = speedSqr;
-
             vel[i] = v;
             pos[i] = p;
         }
-        maxSpeed = std::sqrt(maxSpeedSqr);
     }
 
     std::vector<Vec2> pos;
@@ -573,6 +577,15 @@ static inline __m256 rsqrtRefined(__m256 x) {
     const __m256 rr = _mm256_mul_ps(r, r);
     const __m256 t = _mm256_fnmadd_ps(_mm256_mul_ps(half, x), rr, threeHalves);
     return _mm256_mul_ps(r, t);
+}
+
+static inline float horizontalMax(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_max_ps(lo, hi);
+    lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_max_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+    return _mm_cvtss_f32(lo);
 }
 
 static inline float horizontalSum(__m256 v) {
@@ -834,7 +847,7 @@ private:
         maxSpeed = std::sqrt(maxSqr);
     }
 
-    void forcesAndIntegrateRange(int lo, int hi, float dt, float& maxSpeedSqr) {
+    void forcesAndIntegrateRange(int lo, int hi, float dt, float& maxRelSpeedSqr) {
         const float* __restrict sx = sorted.x;
         const float* __restrict sy = sorted.y;
         const float* __restrict svx = sorted.vx;
@@ -889,6 +902,10 @@ private:
             const __m256 vMyVY = _mm256_set1_ps(myVY);
             __m256 accForceX = _mm256_setzero_ps();
             __m256 accForceY = _mm256_setzero_ps();
+            // What can tunnel is relative motion between neighbours, not
+            // absolute speed - a block of particles falling together is in no
+            // danger however fast it drops.
+            __m256 maxRelSqr = _mm256_setzero_ps();
 
             for (int y = startY; y <= endY; ++y) {
                 const int rowBase = y * cols;
@@ -930,6 +947,10 @@ private:
                     const __m256 relVY = _mm256_and_ps(_mm256_sub_ps(_mm256_loadu_ps(svy + j), vMyVY), hit);
                     accForceX = _mm256_fmadd_ps(relVX, vDamping, accForceX);
                     accForceY = _mm256_fmadd_ps(relVY, vDamping, accForceY);
+
+                    // Already masked, so non-neighbours contribute zero.
+                    maxRelSqr = _mm256_max_ps(maxRelSqr,
+                        _mm256_fmadd_ps(relVX, relVX, _mm256_mul_ps(relVY, relVY)));
                 }
             }
 
@@ -961,8 +982,8 @@ private:
             if (px > (float)screenWidth) { px = (float)screenWidth; vx *= bounce; }
             if (py > (float)screenHeight) { py = (float)screenHeight; vy *= bounce; vx *= boundaryFriction; }
 
-            const float speedSqr = vx * vx + vy * vy;
-            if (speedSqr > maxSpeedSqr) maxSpeedSqr = speedSqr;
+            const float relSqr = horizontalMax(maxRelSqr);
+            if (relSqr > maxRelSpeedSqr) maxRelSpeedSqr = relSqr;
 
             live.x[i] = px;
             live.y[i] = py;
@@ -1006,8 +1027,8 @@ struct AppOptions {
     int threads = 0;            // 0 = auto
     float fixedHz = 0.0f;       // 0 = derive from density
     int prespawn = 0;
-    int width = 800;
-    int height = 450;
+    int width = 1200;
+    int height = 720;
     const wchar_t* dumpPath = nullptr;
 };
 
@@ -1021,8 +1042,8 @@ static HGDIOBJ g_oldBitmap = nullptr;
 static uint32_t* g_bits = nullptr;
 static int g_bbWidth = 0;
 static int g_bbHeight = 0;
-static int g_clientWidth = 800;
-static int g_clientHeight = 450;
+static int g_clientWidth = 1200;
+static int g_clientHeight = 720;
 static float g_mouseX = 0.0f;
 static float g_mouseY = 0.0f;
 static bool g_leftDown = false;
@@ -1331,7 +1352,7 @@ static int runBenchmark() {
         if (x < -1.0f || y < -1.0f || x > (float)width + 1.0f || y > (float)height + 1.0f) ++outOfBounds;
     }
     printf("  final rate : %.0f Hz\n", g_physicsHz);
-    printf("  max speed  : %.1f px/s (travels %.2f px per step)\n",
+    printf("  max approach: %.1f px/s (closes %.2f px per step)\n",
            sim->lastMaxSpeed(), sim->lastMaxSpeed() / g_physicsHz);
     printf("  non-finite : %d\n", notFinite);
     printf("  out of box : %d\n", outOfBounds);
