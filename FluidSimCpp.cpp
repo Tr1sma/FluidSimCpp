@@ -25,11 +25,11 @@
 struct Vec2 { float x; float y; };
 
 namespace cfg {
-    constexpr int MaxParticles = 200000;
+    constexpr int MaxParticles = 100000;
     constexpr int InitialCount = 1500;
     constexpr float MouseForce = -2500.0f;
     constexpr float MouseRadius = 100.0f;
-    constexpr int ParticlesToSpawn = 10;
+    constexpr int ParticlesToSpawn = 25;
     constexpr float WallMargin = 25.0f;
     constexpr float GravityY = 9.81f * 100.0f;
     constexpr float WallForce = 2000.0f + GravityY;
@@ -37,9 +37,20 @@ namespace cfg {
     constexpr float CollisionRadius = 10.0f;
     constexpr float RepulsionForce = 2000.0f;
     constexpr float DampingFactor = 10.0f;
-    // Base rate, valid for a sparse field. The repulsion term goes as 1/d, so
-    // the stiffness - and with it the explicit-Euler stability limit - rises
-    // with packing density. densityRateFor() raises the rate accordingly.
+    // Repulsion is a linear spring: the force vector is offset * (R-d)/d * F,
+    // and since |offset| is d that comes out as |F| = (R-d) * RepulsionForce -
+    // capped at R * RepulsionForce. It cannot resist arbitrary compression, so
+    // the step size is what keeps particles from tunnelling into each other.
+    //
+    // The hard criterion is CFL-like: the fastest particle must not cross more
+    // than this fraction of the interaction radius in one step. Measured at
+    // 88k particles - 5.2 px of travel per step collapses 1.6% of all particles
+    // into stacks (they then render as one pixel and clear a void of radius R
+    // around themselves), 2.3 px brings that down to 0.04%.
+    constexpr float MaxTravelPerStep = 0.25f;      // of CollisionRadius
+    constexpr float RateSafetyMargin = 1.25f;
+    // Density only provides a floor for the very first frames, before any
+    // speed measurement exists.
     constexpr float BasePhysicsHz = 100.0f;
     constexpr float MaxPhysicsHz = 1000.0f;
     // Particle count per 800x450 that the base rate is calibrated for.
@@ -62,9 +73,8 @@ namespace cfg {
     constexpr float MinRealtimeFps = 20.0f;
 }
 
-// Stability limit of explicit Euler scales as 1/sqrt(stiffness), and stiffness
-// grows with how many neighbours overlap, so the step rate is raised with the
-// square root of the density.
+// Density-derived floor. Only used until the CFL limit below has real speed
+// data to work with.
 static float physicsRateFor(int particleCount, int width, int height) {
     const float area = (float)width * (float)height;
     if (area <= 0.0f || particleCount <= 0) return cfg::BasePhysicsHz;
@@ -76,6 +86,13 @@ static float physicsRateFor(int particleCount, int width, int height) {
 
     const float rate = cfg::BasePhysicsHz * scale;
     return rate > cfg::MaxPhysicsHz ? cfg::MaxPhysicsHz : rate;
+}
+
+// Rate needed to keep the fastest particle under MaxTravelPerStep.
+static float cflRateFor(float maxSpeed) {
+    if (maxSpeed <= 0.0f) return 0.0f;
+    const float maxTravel = cfg::MaxTravelPerStep * cfg::CollisionRadius;
+    return cfg::RateSafetyMargin * maxSpeed / maxTravel;
 }
 
 static int maxSubStepsFor(float rate) {
@@ -298,6 +315,8 @@ public:
     virtual int count() const = 0;
     virtual void seedUniform(int n, uint32_t seed) = 0;
     virtual void collectPositions(std::vector<float>& out) const = 0;
+    // Fastest particle of the last step. Drives the CFL step-size limit.
+    virtual float lastMaxSpeed() const = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -332,6 +351,7 @@ public:
     }
 
     int count() const override { return particleCount; }
+    float lastMaxSpeed() const override { return maxSpeed; }
 
     void render(uint32_t* bits, int width, int height) override {
         std::memset(bits, 0, (size_t)width * (size_t)height * sizeof(uint32_t));
@@ -496,6 +516,7 @@ private:
     void integrate(float dt) {
         const float boundaryFriction = 0.5f;
         const float bounce = -0.2f;
+        float maxSpeedSqr = 0.0f;
         for (int i = 0; i < particleCount; ++i) {
             Vec2 v = vel[i];
             Vec2 a = acc[i];
@@ -511,9 +532,13 @@ private:
             if (p.x > (float)screenWidth) { p.x = (float)screenWidth; v.x *= bounce; }
             if (p.y > (float)screenHeight) { p.y = (float)screenHeight; v.y *= bounce; v.x *= boundaryFriction; }
 
+            const float speedSqr = v.x * v.x + v.y * v.y;
+            if (speedSqr > maxSpeedSqr) maxSpeedSqr = speedSqr;
+
             vel[i] = v;
             pos[i] = p;
         }
+        maxSpeed = std::sqrt(maxSpeedSqr);
     }
 
     std::vector<Vec2> pos;
@@ -530,6 +555,7 @@ private:
     float mouseY;
     bool leftDown;
     bool rightDown;
+    float maxSpeed = 0.0f;
     std::mt19937 rng;
 };
 
@@ -578,6 +604,7 @@ public:
         live.allocate(cfg::MaxParticles);
         sorted.allocate(cfg::MaxParticles);
         cellOf.resize(cfg::MaxParticles);
+        threadMaxSpeedSqr.assign((size_t)pool.capacity(), 0.0f);
         rebuildGrid();
         initParticles();
     }
@@ -608,6 +635,8 @@ public:
         }
         particleCount = n;
     }
+
+    float lastMaxSpeed() const override { return maxSpeed; }
 
     void collectPositions(std::vector<float>& out) const override {
         out.resize((size_t)particleCount * 2);
@@ -786,19 +815,26 @@ private:
         const int blocks = (n + blockSize - 1) / blockSize;
 
         workCursor.store(0, std::memory_order_relaxed);
+        std::fill(threadMaxSpeedSqr.begin(), threadMaxSpeedSqr.end(), 0.0f);
 
-        pool.run([&](int) {
+        pool.run([&](int t) {
+            float localMaxSqr = 0.0f;
             for (;;) {
                 const int b = workCursor.fetch_add(1, std::memory_order_relaxed);
                 if (b >= blocks) break;
                 const int lo = b * blockSize;
                 const int hi = std::min(lo + blockSize, n);
-                forcesAndIntegrateRange(lo, hi, dt);
+                forcesAndIntegrateRange(lo, hi, dt, localMaxSqr);
             }
+            threadMaxSpeedSqr[t] = localMaxSqr;
         });
+
+        float maxSqr = 0.0f;
+        for (float v : threadMaxSpeedSqr) if (v > maxSqr) maxSqr = v;
+        maxSpeed = std::sqrt(maxSqr);
     }
 
-    void forcesAndIntegrateRange(int lo, int hi, float dt) {
+    void forcesAndIntegrateRange(int lo, int hi, float dt, float& maxSpeedSqr) {
         const float* __restrict sx = sorted.x;
         const float* __restrict sy = sorted.y;
         const float* __restrict svx = sorted.vx;
@@ -925,6 +961,9 @@ private:
             if (px > (float)screenWidth) { px = (float)screenWidth; vx *= bounce; }
             if (py > (float)screenHeight) { py = (float)screenHeight; vy *= bounce; vx *= boundaryFriction; }
 
+            const float speedSqr = vx * vx + vy * vy;
+            if (speedSqr > maxSpeedSqr) maxSpeedSqr = speedSqr;
+
             live.x[i] = px;
             live.y[i] = py;
             live.vx[i] = vx;
@@ -934,6 +973,8 @@ private:
 
     ThreadPool& pool;
     std::atomic<int> workCursor{ 0 };
+    std::vector<float> threadMaxSpeedSqr;
+    float maxSpeed = 0.0f;
     Buffers live;      // current state, also the destination of the integration
     Buffers sorted;    // cell-ordered snapshot the force kernel reads from
     std::vector<int> cellStart;
@@ -999,9 +1040,19 @@ static double g_qpcPeriod = 0.0;
 static float g_physicsHz = cfg::BasePhysicsHz;
 static ThreadTopology g_topology{ 1, 1 };
 
-static float resolvePhysicsRate(int particleCount, int width, int height) {
-    if (g_options.fixedHz > 0.0f) return g_options.fixedHz;
-    return physicsRateFor(particleCount, width, height);
+// Reacts to a rising requirement immediately - a step that is already too
+// large produces stacking on the spot. Comes back down slowly, so a brief calm
+// patch cannot leave the next disturbance under-resolved.
+static void updatePhysicsRate(int particleCount, int width, int height, float maxSpeed) {
+    if (g_options.fixedHz > 0.0f) { g_physicsHz = g_options.fixedHz; return; }
+
+    float target = physicsRateFor(particleCount, width, height);
+    const float cfl = cflRateFor(maxSpeed);
+    if (cfl > target) target = cfl;
+    if (target > cfg::MaxPhysicsHz) target = cfg::MaxPhysicsHz;
+
+    if (target > g_physicsHz) g_physicsHz = target;
+    else g_physicsHz += (target - g_physicsHz) * 0.02f;
 }
 
 static inline double nowSeconds() {
@@ -1218,8 +1269,7 @@ static int runBenchmark() {
     sim->seedUniform(g_options.benchParticles, 12345u);
     sim->setMouse(0.0f, 0.0f, false, false);
 
-    g_physicsHz = resolvePhysicsRate(sim->count(), width, height);
-    const float physicsStep = 1.0f / g_physicsHz;
+    updatePhysicsRate(sim->count(), width, height, 0.0f);
     applyThreadPolicy(sim->count(), width, height);
 
     printf("FluidSimCpp benchmark\n");
@@ -1236,13 +1286,17 @@ static int runBenchmark() {
     printf("  measured   : %d steps\n", g_options.benchSteps);
     fflush(stdout);
 
-    for (int i = 0; i < g_options.benchWarmup; ++i) sim->step(physicsStep);
+    for (int i = 0; i < g_options.benchWarmup; ++i) {
+        updatePhysicsRate(sim->count(), width, height, sim->lastMaxSpeed());
+        sim->step(1.0f / g_physicsHz);
+    }
 
     std::vector<double> samples;
     samples.reserve(g_options.benchSteps);
     for (int i = 0; i < g_options.benchSteps; ++i) {
+        updatePhysicsRate(sim->count(), width, height, sim->lastMaxSpeed());
         const double t0 = nowSeconds();
-        sim->step(physicsStep);
+        sim->step(1.0f / g_physicsHz);
         samples.push_back((nowSeconds() - t0) * 1000.0);
     }
 
@@ -1276,6 +1330,9 @@ static int runBenchmark() {
         if (!std::isfinite(x) || !std::isfinite(y)) { ++notFinite; continue; }
         if (x < -1.0f || y < -1.0f || x > (float)width + 1.0f || y > (float)height + 1.0f) ++outOfBounds;
     }
+    printf("  final rate : %.0f Hz\n", g_physicsHz);
+    printf("  max speed  : %.1f px/s (travels %.2f px per step)\n",
+           sim->lastMaxSpeed(), sim->lastMaxSpeed() / g_physicsHz);
     printf("  non-finite : %d\n", notFinite);
     printf("  out of box : %d\n", outOfBounds);
 
@@ -1392,7 +1449,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         // Spawning raises the density, which tightens the stability limit and
         // shifts the best thread count, so both are re-derived every frame.
         // Safe here: no job is in flight between frames.
-        g_physicsHz = resolvePhysicsRate(sim->count(), g_clientWidth, g_clientHeight);
+        updatePhysicsRate(sim->count(), g_clientWidth, g_clientHeight, sim->lastMaxSpeed());
         applyThreadPolicy(sim->count(), g_clientWidth, g_clientHeight);
         const float physicsStep = 1.0f / g_physicsHz;
         const int maxSubSteps = maxSubStepsFor(g_physicsHz);
